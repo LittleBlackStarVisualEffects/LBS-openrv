@@ -120,7 +120,7 @@ class AYONMenus(MinorMode):
                 # Menu name
                 # NOTE: If it already exists it will merge with existing
                 # and add submenus / menuitems to the existing one
-                ("AYON", self.menu_item()),
+                ("BLACK", self.menu_item()),
             ],
             # initialization order
             sortKey="source_setup",
@@ -181,6 +181,11 @@ class AYONMenus(MinorMode):
         self._is_closing = True
 
     def open_desktop_review_panel(self, panel_name: str, *_):
+        # The startup panel-restore (`_open_visible_panels`) can fire before
+        # the controller is initialized (or when the review feature is
+        # disabled), so guard against a missing controller.
+        if getattr(self, "review_controller", None) is None:
+            return
         panel = self.review_controller.get_panel(panel_name)
         dock_widget = self.review_controller.set_docker_widget(
             self._parent, panel, panel_name
@@ -199,16 +204,23 @@ class AYONMenus(MinorMode):
             self._connected_panels.add(panel_name)
 
     def add_desktop_review_menu_items(self, menu):
-        # Check if addon is enabled
+        # Check if the review feature is enabled (ported into lbs_tools)
         project_settings = get_project_settings(get_current_project_name())
-        review_desktop = project_settings.get("review_desktop", {})
-        if not review_desktop.get("enabled", False):
+        review_settings = (
+            project_settings.get("lbs_tools", {}).get("review", {})
+        )
+        if not review_settings.get("enabled", False):
             return
-        # import review desktop controller
+        # import review session controller
         try:
-            from ayon_review_desktop.session_controller import ReviewController
+            from ayon_lbs_tools.review.session_controller import (
+                ReviewController,
+            )
         except ImportError:
-            print("Failed to import 'ayon_review_desktop.session_controller':")
+            print(
+                "Failed to import"
+                " 'ayon_lbs_tools.review.session_controller':"
+            )
             traceback.print_exc()
             return
         # instance controler and return the menu items.
