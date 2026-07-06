@@ -153,9 +153,33 @@ class AYONMenus(MinorMode):
             self._read_panel_startup_visibility()
         )
 
+        # Prune panels that are no longer registered (e.g. removed from
+        # the ui.panels() registry) - a stale settings entry would raise
+        # KeyError at every session start otherwise.
+        controller = getattr(self, "review_controller", None)
+        if controller is not None:
+            available = set(controller.get_available_panels())
+            stale = [
+                name for name in self._panel_startup_visibility
+                if name not in available
+            ]
+            if stale:
+                print(f"[AYONMenus] pruning unknown startup panels: {stale}")
+                self._panel_startup_visibility = [
+                    name for name in self._panel_startup_visibility
+                    if name in available
+                ]
+                rv.commands.writeSettings(
+                    "ayon",
+                    "panel_startup_visibility",
+                    self._panel_startup_visibility,
+                )
+
         for panel_name in self._panel_startup_visibility:
+            # bind per-iteration (a bare lambda would capture the loop
+            # variable and open the LAST panel N times)
             QTimer.singleShot(
-                0, lambda: self.open_desktop_review_panel(panel_name)
+                0, partial(self.open_desktop_review_panel, panel_name)
             )
 
     @property

@@ -223,9 +223,21 @@ class BaseMediaLoader(load.LoaderPlugin):
             self.log.info(f"Setting colorspace: {colorspace}")
             group = rv.commands.nodeGroup(node)
 
-            # Enable OCIO for the node and set the colorspace
-            set_group_ocio_active_state(group, state=True)
-            set_group_ocio_colorspace(group, colorspace)
+            # Enable OCIO for the node and set the colorspace.
+            # Best-effort: without RV's `ocio_source_setup` package (e.g.
+            # review sessions manage OCIO themselves) the state toggle
+            # raises - the media must still load, so only warn.
+            try:
+                set_group_ocio_active_state(group, state=True)
+                set_group_ocio_colorspace(group, colorspace)
+            except Exception:
+                self.log.warning(
+                    "Could not set OCIO colorspace %r for %s "
+                    "(is RV's OCIO package loaded?)",
+                    colorspace,
+                    group,
+                    exc_info=True,
+                )
 
 
 class FramesLoader(BaseMediaLoader):

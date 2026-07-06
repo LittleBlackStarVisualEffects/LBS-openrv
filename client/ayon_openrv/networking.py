@@ -477,16 +477,25 @@ class LoadContainerHandler:
             log.warning("MovLoader plugin not found")
 
         for repre in repre_entities:
-            filepath = get_representation_path(repre)
-            extension = os.path.splitext(filepath)[1].lstrip(".").lower()
+            # per-item guard: one broken item must not abort the rest of
+            # a playlist load
+            try:
+                filepath = get_representation_path(repre)
+                extension = os.path.splitext(filepath)[1].lstrip(".").lower()
 
-            self._load_by_extension(
-                repre,
-                extension,
-                project_name,
-                frames_loader_plugin,
-                mov_loader_plugin,
-            )
+                self._load_by_extension(
+                    repre,
+                    extension,
+                    project_name,
+                    frames_loader_plugin,
+                    mov_loader_plugin,
+                )
+            except Exception:
+                log.error(
+                    "Failed to load representation %s",
+                    repre.get("id"),
+                    exc_info=True,
+                )
 
     def _load_by_extension(
         self,
