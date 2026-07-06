@@ -215,29 +215,61 @@ class BaseMediaLoader(load.LoaderPlugin):
 
     def set_representation_colorspace(self, node, representation):
         colorspace_data = representation.get("data", {}).get("colorspaceData")
-        if colorspace_data:
-            colorspace = colorspace_data["colorspace"]
-            # TODO: Confirm colorspace is valid in current OCIO config
-            #   otherwise errors will be spammed from OpenRV for invalid space
+        colorspace = (colorspace_data or {}).get("colorspace")
+        if not colorspace:
+            # no publish-time colorspace - resolve from AYON imageio
+            # file rules (settings) against the actual media path
+            colorspace = self._colorspace_from_ayon_file_rules(node)
+        if not colorspace:
+            return
 
-            self.log.info(f"Setting colorspace: {colorspace}")
-            group = rv.commands.nodeGroup(node)
+        self.log.info(f"Setting colorspace: {colorspace}")
+        group = rv.commands.nodeGroup(node)
 
-            # Enable OCIO for the node and set the colorspace.
-            # Best-effort: without RV's `ocio_source_setup` package (e.g.
-            # review sessions manage OCIO themselves) the state toggle
-            # raises - the media must still load, so only warn.
-            try:
-                set_group_ocio_active_state(group, state=True)
-                set_group_ocio_colorspace(group, colorspace)
-            except Exception:
-                self.log.warning(
-                    "Could not set OCIO colorspace %r for %s "
-                    "(is RV's OCIO package loaded?)",
-                    colorspace,
-                    group,
-                    exc_info=True,
-                )
+        # Enable OCIO for the node and set the colorspace.
+        # Best-effort: without RV's `ocio_source_setup` package the state
+        # toggle raises - the media must still load, so only warn.
+        try:
+            set_group_ocio_active_state(group, state=True)
+            set_group_ocio_colorspace(group, colorspace)
+        except Exception:
+            self.log.warning(
+                "Could not set OCIO colorspace %r for %s "
+                "(is RV's OCIO package loaded?)",
+                colorspace,
+                group,
+                exc_info=True,
+            )
+
+    def _colorspace_from_ayon_file_rules(self, node):
+        """File colorspace from AYON imageio file rules (settings).
+
+        Uses the active OCIO config (resolved from AYON color management
+        into $OCIO at launch) and core's file-rule matching. Returns None
+        when color management is inactive or nothing matches.
+        """
+        ocio_config_path = os.environ.get("OCIO")
+        if not ocio_config_path:
+            return None
+        try:
+            from ayon_core.pipeline import get_current_project_name
+            from ayon_core.pipeline.colorspace import (
+                get_colorspace_name_from_filepath,
+            )
+
+            filepath = rv.commands.sourceMedia(node)[0]
+            return get_colorspace_name_from_filepath(
+                filepath,
+                "openrv",
+                get_current_project_name(),
+                {"path": ocio_config_path},
+            )
+        except Exception:
+            self.log.warning(
+                "Could not resolve colorspace from AYON file rules",
+                exc_info=True,
+            )
+            return None
 
 
 class FramesLoader(BaseMediaLoader):

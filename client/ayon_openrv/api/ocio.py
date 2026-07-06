@@ -111,6 +111,99 @@ def set_current_ocio_active_state(state):
     )
 
 
+def set_display_ocio(display=None, view=None):
+    """Activate the OCIODisplay transform on every display group.
+
+    Direct node operations (mirrors what ocio_source_setup's "Active" +
+    view menu items do) instead of walking RV's OCIO menu - the menu
+    layout changes between RV versions (3.1 titles entries by device
+    name), which silently broke the menu-walk approach.
+
+    Resolution order for the view: ``AYON_RV_OCIO_VIEW`` env var, the
+    ``view`` argument, then the config's default view. Invalid views fall
+    back to the config default.
+
+    Returns:
+        tuple[str, str] | None: (display, view) applied, or None when
+            OCIO is not active.
+    """
+    if os.environ.get("OCIO") is None:
+        return None
+
+    import PyOpenColorIO as OCIO
+
+    config = OCIO.GetCurrentConfig()
+    if display is None:
+        display = config.getDefaultDisplay()
+    view = os.environ.get("AYON_RV_OCIO_VIEW") or view
+    valid_views = list(config.getViews(display))
+    if view not in valid_views:
+        if view:
+            print(
+                f"WARNING: view {view!r} not in config views {valid_views},"
+                " using config default"
+            )
+        view = config.getDefaultView(display)
+
+    display_groups = rv.commands.nodesOfType("RVDisplayGroup")
+
+    # pass 1: make sure every monitor's display pipeline hosts an
+    # OCIODisplay node (swaps out RV's default display color node)
+    for group in display_groups:
+        try:
+            dpipeline = group_member_of_type(
+                group, "RVDisplayPipelineGroup"
+            )
+            if not dpipeline:
+                continue
+            nodes = rv.commands.getStringProperty(
+                f"{dpipeline}.pipeline.nodes"
+            )
+            if "OCIODisplay" not in nodes:
+                rv.commands.setStringProperty(
+                    f"{dpipeline}.pipeline.nodes", ["OCIODisplay"], True
+                )
+        except Exception as error:
+            print(f"WARNING: OCIO pipeline swap failed for {group}: {error}")
+
+    # pass 2: configure + activate each monitor's node
+    for group in display_groups:
+        try:
+            dpipeline = group_member_of_type(
+                group, "RVDisplayPipelineGroup"
+            )
+            docio = dpipeline and group_member_of_type(
+                dpipeline, "OCIODisplay"
+            )
+            if not docio:
+                print(f"WARNING: no OCIODisplay node in {group} - skipped")
+                continue
+            # disable while changing display/view (avoids shader rebuild
+            # in an invalid intermediate state), same as ocio_source_setup
+            rv.commands.setIntProperty(f"{docio}.ocio.active", [0], True)
+            rv.commands.setStringProperty(
+                f"{docio}.ocio.function", ["display"], True
+            )
+            rv.commands.setStringProperty(
+                f"{docio}.ocio.inColorSpace", [OCIO.ROLE_SCENE_LINEAR], True
+            )
+            rv.commands.setStringProperty(
+                f"{docio}.ocio_display.display", [display], True
+            )
+            rv.commands.setStringProperty(
+                f"{docio}.ocio_display.view", [view], True
+            )
+            rv.commands.setIntProperty(f"{docio}.ocio.active", [1], True)
+            device = rv.commands.getStringProperty(
+                f"{group}.device.name"
+            )[0]
+            print(f"INFO: OCIO display on {device!r}: {display} / {view}")
+        except Exception as error:
+            print(f"WARNING: OCIO display setup failed for {group}: {error}")
+    rv.commands.redraw()
+    return display, view
+
+
 def set_ocio_display_active_state():
     """Set the OCIO display active state for the currently active source.
 
