@@ -5,20 +5,22 @@ import os
 import sys
 import traceback
 from functools import partial
+from typing import Callable
 
 import rv.qtutils
 from ayon_api import get_representations
 from ayon_core.pipeline import (
-    discover_loader_plugins,
     get_current_project_name,
     install_host,
     load_container,
     registered_host,
 )
+from ayon_core.lib.transcoding import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from ayon_core.pipeline.load import get_loaders_by_name
 from ayon_core.settings import get_project_settings
 from ayon_core.tools.utils import host_tools
 from ayon_openrv.api import OpenRVHost
-from ayon_openrv.networking import LoadContainerHandler
+from ayon_openrv.networking import LoadContainerHandler, RVConnector
 from qtpy.QtCore import QEvent, QObject, QTimer
 from qtpy.QtWidgets import QApplication
 from rv.rvtypes import MinorMode
@@ -100,22 +102,41 @@ class DockCloseFilter(QObject):
 class AYONMenus(MinorMode):
     def __init__(self):
         MinorMode.__init__(self)
+
+        self.review_controller = None
+
+        bindings: list[tuple[str, Callable, str]] = [
+            # event name, callback, description
+            (
+                "ayon_load_container",
+                on_ayon_load_container,
+                "Loads an AYON representation into the session.",
+            ),
+            (
+                "remote-contact-error-show",
+                on_remote_contact_error_show,
+                (
+                    "Hide RV network errors caused by the AYON controller"
+                    " connection."
+                ),
+            ),
+            (
+                "session-initialized",
+                self._open_visible_panels,
+                "Open visible panels on session initialization",
+            ),
+        ]
+        if os.getenv("AYON_RV_UNSET_SESSION") == "1":
+            bindings.append((
+                "after-session-read",
+                self._unset_session_filename,
+                "Unset session after start",
+            ))
+
         self.init(
             name="py-ayon",
             globalBindings=None,
-            overrideBindings=[
-                # event name, callback, description
-                (
-                    "ayon_load_container",
-                    on_ayon_load_container,
-                    "Loads an AYON representation into the session.",
-                ),
-                (
-                    "session-initialized",
-                    self._open_visible_panels,
-                    "Open visible panels on session initialization",
-                ),
-            ],
+            overrideBindings=bindings,
             menu=[
                 # Menu name
                 # NOTE: If it already exists it will merge with existing
@@ -129,6 +150,16 @@ class AYONMenus(MinorMode):
         self._panel_startup_visibility = []
         self._connected_panels = set()
         self._is_closing = False
+        self._session_was_unset = False
+
+    def _unset_session_filename(self, event=None):
+        # Only ever run once
+        if self._session_was_unset:
+            return
+
+        self._session_was_unset = True
+        logging.debug("Unsetting session filename...")
+        rv.commands.setSessionFileName("")
 
     def _read_panel_startup_visibility(self):
         return rv.commands.readSettings("ayon", "panel_startup_visibility", [])
@@ -148,7 +179,11 @@ class AYONMenus(MinorMode):
         )
 
     def _open_visible_panels(self, event):
+        """Re-open desktop review panels that were visible last session."""
         event.reject()
+        if self.review_controller is None:
+            return
+
         self._panel_startup_visibility: list[str] = (
             self._read_panel_startup_visibility()
         )
@@ -235,7 +270,8 @@ class AYONMenus(MinorMode):
         )
         if not review_settings.get("enabled", False):
             return
-        # import review session controller
+
+        # import review desktop controller
         try:
             from ayon_lbs_tools.review.session_controller import (
                 ReviewController,
@@ -247,7 +283,8 @@ class AYONMenus(MinorMode):
             )
             traceback.print_exc()
             return
-        # instance controler and return the menu items.
+
+        # Instantiate controller and add menu items.
         self.review_controller = ReviewController(host="rv")
         menu.append(("_", None))  # separator
         for k, panel_name in enumerate(
@@ -284,13 +321,51 @@ class AYONMenus(MinorMode):
 
 def data_loader():
     incoming_data_file = os.environ.get("AYON_LOADER_REPRESENTATIONS", None)
-    if incoming_data_file:
-        with open(incoming_data_file, "rb") as file:
-            decoded_data = json.load(file)
-        os.remove(incoming_data_file)
-        load_data(dataset=decoded_data["representations"])
-    else:
+    if not incoming_data_file:
         print("No data for auto-loader")
+        return
+
+    if not os.path.exists(incoming_data_file):
+        print(
+            f"No data for auto-loader, file not found '{incoming_data_file}'."
+        )
+        return
+
+    with open(incoming_data_file, "rb") as file:
+        decoded_data = json.load(file)
+    os.remove(incoming_data_file)
+    load_representations(
+        representation_ids=decoded_data["representation_ids"]
+    )
+
+
+def get_ayon_connection_name() -> str:
+    """Return the network connection name the AYON addon connects with."""
+    try:
+        settings = RVConnector._get_settings()
+        return settings["network"]["conn_name"]
+    except Exception:
+        return "ayon-rv-connect"
+
+
+def on_remote_contact_error_show(event):
+    """RV asks whether a network contact error should be shown to the user.
+
+    The AYON addon connects to a running OpenRV to push a representation and
+    disconnects right after. RV keeps that connection as a network contact
+    and reports the disconnect as a network error, which is not actionable
+    for the artist. Set the event response to hide it for the AYON connection
+    only.
+    """
+    contact = event.contents() or ""
+    name = contact.split("@")[0]
+    base_name = get_ayon_connection_name()
+    # Connections identify themselves as '<name>-<pid>-<n>' so that RV never
+    # confuses them with a previous connection.
+    if name == base_name or name.startswith(f"{base_name}-"):
+        event.setReturnContent("no")
+        return
+    event.setReturnContent("yes")
 
 
 def on_ayon_load_container(event):
@@ -298,20 +373,32 @@ def on_ayon_load_container(event):
     handler.handle_event()
 
 
-def load_data(dataset=None):
+def load_representations(representation_ids: list[str]):
+    """Load media by representation id and pick the relevant loader."""
     project_name = get_current_project_name()
-    available_loaders = discover_loader_plugins(project_name)
-    Loader = next(
-        loader
-        for loader in available_loaders
-        if loader.__name__ == "FramesLoader"
-    )
+    loaders_by_name = get_loaders_by_name()
 
     representations = get_representations(
-        project_name, representation_ids=dataset
+        project_name, representation_ids=representation_ids
     )
-
     for representation in representations:
+        ext: str = (
+            representation.get("data", {}).get("context", {}).get("ext")
+            or representation["name"]
+        )
+        ext = f".{ext}"
+        if ext in VIDEO_EXTENSIONS:
+            loader_name = "MovLoader"
+        elif ext in IMAGE_EXTENSIONS:
+            loader_name = "FramesLoader"
+        else:
+            # Fallback
+            logging.warning(
+                "Unknown media extension: %s. Falling back to 'FramesLoader'",
+                ext
+            )
+            loader_name = "FramesLoader"
+        Loader = loaders_by_name.get(loader_name)
         load_container(Loader, representation)
 
 
